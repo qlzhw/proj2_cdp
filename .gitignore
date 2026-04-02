@@ -43,3 +43,7 @@ personal_TASK.md
 easytrain.sh
 output/
 data/
+third_party/dexart-release/assets
+third_party/VRL3/ckpts
+third_party/VRL3/vrl3_ckpts.zip
+third_party/dexart-release/dexart_assets.zip

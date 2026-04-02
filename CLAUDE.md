@@ -1,7 +1,4 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
+# AGENTS.md — CDP (Causal Diffusion Policy)
 
 ## Guidelines
 
@@ -21,127 +18,93 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   export no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8  # 内网不走代理
   ```
 
+## Project Identity
+CDP: transformer-based diffusion model for robot visuomotor policy learning, conditioning on historical action sequences (TEDi-style causal conditioning). Built on top of [3D Diffusion Policy](https://github.com/YanjieZe/3D-Diffusion-Policy).
 
-## Architecture Overview
+Paper: "CDP: Towards Robust Autoregressive Visuomotor Policy Learning via Causal Diffusion" (arXiv:2506.14769)
 
-Fork of [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) + custom **EnergyNet / Generate & Rank** pipeline. O(N+M) task-method separation:
-- **Task side**: `Dataset` + `EnvRunner` + `config/task/<task_name>.yaml`
-- **Method side**: `Policy` + `Workspace` + `config/<workspace_name>.yaml`
-
-### Key Abstractions
-| Component | Base Class | Role |
-|-----------|-----------|------|
-| **Workspace** | `workspace/base_workspace.py` | Training lifecycle: init, train loop, checkpointing, eval |
-| **Policy** | `policy/base_image_policy.py` / `base_lowdim_policy.py` | Inference (`predict_action`) + loss (`compute_loss`) + normalization |
-| **Dataset** | `torch.utils.data.Dataset` | Returns `{obs, action}` dicts; provides `get_normalizer()` |
-| **EnvRunner** | — | Runs policy in env, returns logs/metrics compatible with `wandb.log` |
-
-### Observation/Action Interface
-- **Observation Horizon** (`To` / `n_obs_steps`), **Action Horizon** (`Ta` / `n_action_steps`), **Prediction Horizon** (`T` / `horizon`)
-
-### Multi-Stage Pipeline
-1. **Stage-1 (ScoreNet)**: Standard diffusion training (`agent_type='score'`)
-2. **Stage-2 (EnergyNet)**: DSM score matching (`agent_type='energy'`), freezes `obs_encoder`
-3. **Stage-3 (Eval)**: Online Generate & Rank via `eval.py --use_energy_ranking`
-
-
----
-
-# DEEP KNOWLEDGE BASE
-
-**Generated:** 2026-03-24 | **Commit:** `3eb6938` | **Branch:** `3.23-adaptive-energy`
-
-## STRUCTURE MAP
+## Repository Layout
 ```
-.
-├── diffusion_policy/          # Core library → see diffusion_policy/AGENTS.md
-│   ├── policy/                # 13 files — Policy classes (dual-mode score/energy/ranker)
-│   ├── model/                 # 5 subdirs — UNet, Transformer, EnergyNet, BET, vision encoders
-│   │   ├── energy/            # TrajectoryEnergyNet (ranker network)
-│   │   ├── diffusion/         # ConditionalUnet1D, TransformerForDiffusion, schedulers
-│   │   ├── common/            # Normalizer, LR scheduler, tensor utils, DictOfTensorMixin
-│   │   ├── vision/            # ResNet obs encoder, multi-image obs encoder
-│   │   └── bet/               # BET baseline (MinGPT-based)
-│   ├── workspace/             # 12 files — Training orchestrators per method
-│   ├── dataset/               # 11 files — Dataset adapters + RankerCacheDataset
-│   ├── config/                # Hydra configs: 22 workspace YAMLs + task/ subdir (20 tasks)
-│   ├── env_runner/            # 9 files — Vectorized env evaluation
-│   ├── env/                   # 4 envs: pusht, kitchen, block_pushing, robomimic
-│   ├── common/                # 16 files — replay_buffer, sampler, normalizer, pytorch_util
-│   ├── real_world/            # 11 files — UR5 + RealSense + SpaceMouse real robot
-│   ├── shared_memory/         # Lock-free ring buffers for real-time multi-camera
-│   ├── add_src/               # DBSCAN eps sweep utility
-│   └── scripts/               # Data conversion, real robot scripts
-├── debug/                     # Experiment pipelines by version → see debug/AGENTS.md
-├── notes/                     # Dev plans (3.8-3.10), analysis, usage guides
-├── tests/                     # 13 pytest files
-├── train.py                   # @hydra.main → Workspace._target_ → workspace.run()
-├── eval.py                    # Click CLI → load ckpt → optional G&R → env_runner.run()
-└── eval_real_robot.py         # Real robot eval with UR5
+.                                   # outer wrapper repo
+├── Causal-Diffusion-Policy/        # inner project (installable package)
+│   ├── train.py                    # Hydra entry point — TrainDP3Workspace
+│   ├── setup.py                    # pip install -e .
+│   └── diffusion_policy/           # core library (see child AGENTS.md)
+├── scripts/                        # CLI wrappers (train_policy.sh, gen_demonstration_*.sh)
+├── third_party/                    # 7 vendored deps (gym-0.21.0, mujoco-py, Metaworld, dexart, mj_envs, mjrl, pytorch3d_simplified)
+├── visualizer/                     # separate pip-installable visualization package
+├── debug/                          # debug notebooks/scripts
+└── notes/                          # research notes
 ```
+**Nested repo**: the actual code lives in `Causal-Diffusion-Policy/`, not root. `train.py` and `diffusion_policy/` are inside the inner directory.
 
-## DISPATCH FLOW
+## 4 Policy Variants
+| Policy | File | Backbone | Observation | Scheduler |
+|--------|------|----------|-------------|-----------|
+| DP2 | `policy/dp2.py` | ConditionalUnet1D | Multi-image (RGB) | DDPMScheduler |
+| DP3 | `policy/dp3.py` | ConditionalUnet1D | Point cloud | DDPMScheduler |
+| CDP2 | `policy/cdp2.py` | CausalTransformer | Multi-image (RGB) | DDPMTEDiScheduler |
+| CDP3 | `policy/cdp3.py` | CausalTransformer | Point cloud | DDPMTEDiScheduler |
 
-### train.py
-```
-@hydra.main(config_path="diffusion_policy/config")
-  → OmegaConf.register_new_resolver("eval", eval)
-  → cls = hydra.utils.get_class(cfg._target_)
-  → workspace = cls(cfg)
-  → workspace.run()
-```
+All export class `DP`. Dynamically imported via `_POLICY_MAP` dict in `train.py`. CDP variants add: action buffer, chunked causal masking, KV cache inference.
 
-### eval.py
-```
-Click CLI args: -c checkpoint, -o output_dir, -d device
-  → payload = torch.load(checkpoint, pickle_module=dill)
-  → cfg = payload["cfg"]
-  → workspace = cls(cfg); workspace.load_payload(payload)
-  → policy = workspace.model (or ema_model)
-  → if --use_energy_ranking: patch policy.use_energy_ranking/num_candidates/etc
-  → if --ranker_ckpt_path: policy.init_ranker_net(**arch), agent_type="ranker"
-  → env_runner = hydra.utils.instantiate(cfg.task.env_runner)
-  → runner_log = env_runner.run(policy)
+## Config System
+- **Framework**: Hydra 1.2.0 + OmegaConf
+- **Algorithm configs**: `config/{dp2,dp3,cdp2,cdp3}.yaml` — set `policy._target_` and hyperparams
+- **Task configs**: `config/task/*.yaml` — 61 tasks across 4 environments (Adroit/DexArt/MetaWorld/RealDex)
+- **Composition**: algorithm config `defaults:` imports task config; Hydra `instantiate()` builds objects — no explicit registry
+- **Override pattern**: `python train.py --config-name=cdp3 task=adroit_hammer ...`
+
+## Data Pipeline
+`zarr`-backed `ReplayBuffer` → `SequenceSampler` (episode-boundary-aware, pads at edges) → Dataset → `LinearNormalizer` (fit on data stats) → Policy
+
+Key files: `common/replay_buffer.py`, `common/sampler.py`, `model/common/normalizer.py`
+
+## Training Flow (`train.py`)
+1. Hydra resolves config → `TrainDP3Workspace.__init__()` instantiates dataset, policy, optimizer, EMA
+2. `run()`: training loop with `num_epochs` × `num_train_steps` gradient steps
+3. Each step: sample batch → `policy.compute_loss()` → backward → optimizer step → EMA update
+4. Periodic: validation rollout via `env_runner.run()` → log to wandb → checkpoint
+
+## Environments & Runners
+| Environment | Wrapper | Runner | Third-party |
+|-------------|---------|--------|-------------|
+| Adroit (MuJoCo/mjrl) | `env/adroit/adroit.py` | `adroit_runner.py` | `mj_envs`, `mjrl`, `gym-0.21.0` |
+| DexArt | `env/dexart/dexart_wrapper.py` | `dexart_runner.py` | `dexart-release` |
+| MetaWorld | `env/metaworld/metaworld_wrapper.py` | `metaworld_runner.py` | `Metaworld` |
+| RealDex | N/A | `realdex_runner.py` | N/A |
+
+Runners wrap envs with `MultiStepWrapper` + `SimpleVideoRecordingWrapper`. Evaluation uses `LargestKRecorder` for top-K success rate averaging.
+
+## Shared Utilities (high-reuse across modules)
+- `common/pytorch_util.py`: `dict_apply()`, `replace_submodules()`, `optimizer_to()`
+- `model/common/normalizer.py`: `LinearNormalizer`, `SingleFieldLinearNormalizer`
+- `model/common/module_attr_mixin.py`: device/dtype propagation mixin
+- `common/normalize_util.py`: `get_image_range_normalizer()`
+- `common/logger_util.py`: `LargestKRecorder` for evaluation metrics
+
+## Commands
+```bash
+# Training (always use scripts wrapper)
+bash scripts/train_policy.sh <algorithm> <task> <exp_name> <seed> <gpu_id>
+# Example
+bash scripts/train_policy.sh cdp3 adroit_hammer exp01 0 0
+
+# Demo generation
+bash scripts/gen_demonstration_adroit.sh hammer
+
+# Direct train.py (advanced)
+conda run --no-capture-output -n cdp python train.py --config-name=cdp3 task=adroit_hammer ...
 ```
 
-## CONFIG ROUTING (Hydra)
+## Key Conventions
+- All policies export class named `DP` (not the algorithm name) — `_POLICY_MAP` in `train.py` maps string keys to modules
+- `n_obs_steps`, `n_action_steps`, `horizon` define the temporal window: observe `n_obs_steps` frames, predict `horizon` actions, execute `n_action_steps`
+- CDP adds `n_action_token` (action buffer length) and `n_diffusion_steps_per_token` (per-token denoising budget)
+- Point cloud observations: 1024 points, processed by DP3Encoder (PointNet-based)
+- Image observations: processed by `MultiImageObsEncoder` (ResNet18 backbone + spatial softmax + optional crop randomization)
+- Checkpoints saved to `data/outputs/` with wandb logging
+- No test suite exists; validation is rollout-based (env_runner success rate)
 
-```
-train.py --config-name=train_diffusion_unet_image_workspace task=pusht_image
-         │                                                    │
-         ▼                                                    ▼
-config/train_diffusion_unet_image_workspace.yaml    config/task/pusht_image.yaml
-  _target_: ...TrainDiffusionUnetImageWorkspace        name: pusht_image
-  policy:                                              shape_meta: {obs: ..., action: ...}
-    _target_: ...DiffusionUnetImagePolicy              dataset:
-    shape_meta: ${task.shape_meta}                       _target_: ...PushTImageDataset
-    agent_type: score                                  env_runner:
-    obs_encoder: ...                                     _target_: ...PushTImageRunner
-```
-
-No explicit registry — `_target_` + `hydra.utils.instantiate()` is the discovery mechanism.
-
-## ANTI-PATTERNS & GOTCHAS
-
-| Rule | Detail | Location |
-|------|--------|----------|
-| **NEVER unfreeze obs_encoder in energy/ranker** | `freeze_encoder_for_stage2=True` → `.eval()` + `requires_grad_(False)`. Optimizer must exclude frozen params. | `policy/diffusion_unet_image_policy.py` |
-| **energy mode requires `obs_as_global_cond=True`** | Code raises NotImplementedError otherwise | `policy/diffusion_unet_image_policy.py` |
-| **t_eval must be `torch.long`** | Float dtype breaks noise scheduler embeddings | `workspace/train_diffusion_unet_image_workspace.py` |
-| **DictOfTensorMixin is frozen** | `params_dict.requires_grad_(False)` after load. Not trainable. | `model/common/dict_of_tensor_mixin.py` |
-| **AsyncVectorEnv fork + OpenGL** | Environments with OpenGL init segfault in forked children. Use `dummy_env_fn`. | `gym_util/async_vector_env.py` |
-| **Action window alignment** | `start = n_obs_steps - 1; end = start + n_action_steps`. Must be consistent between cache scoring and eval. | Multiple files |
-| **Normalizer bugs** | Print `scale`/`bias` vectors to debug. Normalization mismatch is the #1 silent failure mode. | `model/common/normalizer.py` |
-
-## KEY FILES (by reference centrality)
-
-| File | Lines | Role |
-|------|-------|------|
-| `policy/diffusion_unet_image_policy.py` | 824 | **Heart of the project.** Dual-mode policy: compute_loss (score/energy/ranker), predict_action (with/without G&R), forward_energy, _energy_rank_and_aggregate |
-| `workspace/train_diffusion_unet_image_workspace.py` | 479 | Training orchestrator. Handles agent_type switching, encoder freezing, ranking validation, rollout skipping |
-| `model/energy/trajectory_energy_net.py` | ~200 | Standalone ranker network. Conv1d trajectory encoder → scalar energy. Supports prefix_mask |
-| `common/replay_buffer.py` | 590 | zarr-backed episode storage. `data/` + `meta/episode_ends`. Supports numpy/zarr backends |
-| `common/sampler.py` | — | SequenceSampler: episode boundary padding for To/Ta. Critical for correct training |
-| `model/common/normalizer.py` | — | LinearNormalizer: saved in checkpoint, applied on GPU. Keys must match shape_meta |
-| `dataset/ranker_cache_dataset.py` | — | Loads merged.pt (candidates/global_cond/scores) for ranker training |
-| `eval.py` | — | Click entry with G&R parameter patching. Writes eval_log.json + run_meta.json |
+## Installation
+See `INSTALL.md`. Key: `conda create -n cdp python=3.8`, then pip install torch + project deps + `pip install -e .` in inner dir + install all 7 third_party packages.
