@@ -187,6 +187,10 @@ class TrainDP3Workspace:
         # save batch for sampling
         train_sampling_batch = None
         test_sampling_batch = None
+        sample_mse_start = cfg.n_obs_steps
+        if cfg.name in {"train_dp2", "train_dp3"}:
+            sample_mse_start -= 1
+        sample_mse_end = sample_mse_start + cfg.n_action_steps
 
 
 
@@ -310,7 +314,10 @@ class TrainDP3Workspace:
                     policy.reset()
                     result = policy.predict_action(obs_dict)
                     pred_action = result['action_pred']
-                    mse = torch.nn.functional.mse_loss(pred_action[:, 16:20, :], gt_action[:, 16:20, :])
+                    mse = torch.nn.functional.mse_loss(
+                        pred_action[:, sample_mse_start:sample_mse_end, :],
+                        gt_action[:, sample_mse_start:sample_mse_end, :]
+                    )
                     step_log['test_action_mse_error'] = mse.item()
 
             # run diffusion sampling on a training batch
@@ -324,7 +331,10 @@ class TrainDP3Workspace:
                     policy.reset()
                     result = policy.predict_action(obs_dict)
                     pred_action = result['action_pred']
-                    mse = torch.nn.functional.mse_loss(pred_action[:, 16:20, :], gt_action[:, 16:20, :])
+                    mse = torch.nn.functional.mse_loss(
+                        pred_action[:, sample_mse_start:sample_mse_end, :],
+                        gt_action[:, sample_mse_start:sample_mse_end, :]
+                    )
                     step_log['train_action_mse_error'] = mse.item()
                     del batch
                     del obs_dict
