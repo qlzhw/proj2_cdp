@@ -1,0 +1,34 @@
+> 提示：本文档用于记录和整理在研究 CDP (Causal Diffusion Policy) 代码和原理过程中的一些零碎小发现与核心机制。
+
+# 发现一：CDP 历史窗口配置
+
+在 CDP (Causal Diffusion Policy) 的实现中：
+- **Horizon (总长度)**：共 40 步。
+- **历史动作 (Historical Actions)**：32 步。这些动作作为 Transformer 主输入序列的起始 Token（历史缓存 (History Buffer)）。
+- **历史观测 (Historical Observations)**：32 帧。由 `DP3Encoder` 编码后，通过 **Cross-Attention (交叉注意力)** 注入 Transformer。
+- **预测窗口 (Prediction Window)**：8 步（即 40 步 Horizon 中的剩余部分）。
+
+**核心结论**：历史上下文是**对称的**，同时维持 32 步的观测和动作，以为自回归生成 (Autoregressive Generation) 提供一致的时序上下文。该 32 步滑动窗口之外的所有信息都会被完全丢弃。
+**公平**：dp，dp3观测也是32，预测8，不过就没有历史动作了。
+
+---
+
+# 发现二：TEDi 框架是什么及其在 CDP 中的应用
+
+## 1. TEDi 框架的本质
+TEDi (Temporally Entangled Diffusion) 不是 CDP 提出来的，而是 CDP 的“地基”。TEDi 是一套通用的算法框架（提出于 SIGGRAPH 2024），它提出了一种让扩散模型能够像自回归模型（如 GPT）一样，逐块 (Chunk-wise) 进行去噪和生成的机制。
+CDP 采用了这套“时间纠缠”的去噪协议，并将其主干网络升级为 `CausalTransformer`，结合点云视觉编码，构建了强大的机器人策略模型。
+
+## 2. TEDi 机制在 CDP (40/32/8) 配置下的具体体现
+在 `horizon=40`, `n_obs_steps=32`, `n_action_steps=8` 的不对称配置下，CDP 将原版 TEDi 的多块复杂机制进行了“降维特化”（未来预测块仅 1 个，大小为 8），但底层工程依然深度依赖 TEDi 的核心机制：
+
+- **异构时间步调度 (Per-token Timesteps)**：
+  标准扩散模型对整个序列使用相同的时间步。但在 CDP 中，前 32 步作为历史记忆（扩散步数为 -1，推理时视为纯净数据）；后 8 步作为未来动作预测，从最大噪声步开始迭代降噪。`DDPMTEDiScheduler` 能够接收形状为 `(Batch, 40)` 的时间步张量，允许同一序列内的 Token 处于不同的去噪生命周期。
+
+- **基于滑动缓存的因果自回归流 (Sliding Window Autoregressive)**：
+  模型在推理时只对后 8 步进行迭代去噪。去噪一旦完成，`action_buffer` 整体向左移动 8 步（丢弃最早的 8 步历史，将刚生成的 8 步划入历史），随后通过 `push_buffer` 将 8 个全新的纯噪声 Token 压入末尾，进行下一轮生成。
+
+- **因果掩码与 KV Cache 的完美结合**：
+  在 `CausalTransformer` 中构建了阶梯状的因果掩码，确保后 8 步单向注意力到前 32 步。得益于因果性，CDP 引入了 KV Cache，推理时无需重复计算前 32 步不变历史的注意力，只需计算后 8 步的增量特征，极大提升了扩散自回归的推理效率。
+
+**总结**：CDP 利用 TEDi 的协议（异构时间步调度器 + `action_buffer` 机制），实现了一个**“具有 32 步长期记忆，每次滚动生成 8 步动作”的因果自回归系统**。

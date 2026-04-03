@@ -8,7 +8,9 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import json
 import hydra
+import logging
 import torch
 import dill
 from omegaconf import OmegaConf
@@ -80,6 +82,35 @@ class TrainDP3Workspace:
         # configure training state
         self.global_step = 0
         self.epoch = 0
+
+    def _to_serializable(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, pathlib.Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: self._to_serializable(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._to_serializable(val) for val in value]
+        return value
+
+    def _append_json_log(self, path, payload):
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a') as f:
+            f.write(json.dumps(self._to_serializable(payload), sort_keys=True, default=str) + '\n')
+
+    def _write_status(self, path, payload):
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w') as f:
+            json.dump(self._to_serializable(payload), f, sort_keys=True, indent=2, default=str)
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -170,6 +201,21 @@ class TrainDP3Workspace:
         #         "output_dir": self.output_dir,
         #     }
         # )
+        logger = logging.getLogger(__name__)
+        wandb_run = wandb.init(
+            dir=str(self.output_dir),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            **cfg.logging
+        )
+        wandb.config.update(
+            {
+                "output_dir": self.output_dir,
+            }
+        )
+        wandb_run.summary['output_dir'] = self.output_dir
+        wandb_run.summary['target_num_epochs'] = int(cfg.training.num_epochs)
+        wandb_run.summary['latest_epoch'] = int(self.epoch)
+        wandb_run.summary['is_completed'] = False
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -196,7 +242,24 @@ class TrainDP3Workspace:
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        for local_epoch_idx in range(cfg.training.num_epochs):
+        status_path = os.path.join(self.output_dir, 'training_status.json')
+        start_record = {
+            'event': 'resume' if (self.epoch > 0 or self.global_step > 0) else 'start',
+            'status': 'running',
+            'epoch': int(self.epoch),
+            'epoch_completed': int(self.epoch),
+            'target_num_epochs': int(cfg.training.num_epochs),
+            'global_step': int(self.global_step),
+            'timestamp': time.time()
+        }
+        self._append_json_log(log_path, start_record)
+        self._write_status(status_path, start_record)
+        logger.info(
+            f"status={start_record['status']} event={start_record['event']} "
+            f"epoch={start_record['epoch_completed']}/{start_record['target_num_epochs']} "
+            f"global_step={start_record['global_step']}"
+        )
+        for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()
@@ -367,15 +430,73 @@ class TrainDP3Workspace:
 
                 if topk_ckpt_path is not None:
                     self.save_checkpoint(path=topk_ckpt_path)
+            topk_values = topk_manager.get_metric_values()
+            step_log['epoch_completed'] = self.epoch + 1
+            step_log['target_num_epochs'] = cfg.training.num_epochs
+            step_log['topk_test_mean_score_count'] = len(topk_values)
+            if len(topk_values) > 0:
+                step_log['topk_test_mean_score_mean'] = topk_manager.get_metric_mean()
+                step_log['topk_test_mean_score_min'] = min(topk_values)
+                step_log['topk_test_mean_score_max'] = max(topk_values)
             # ========= eval end for this epoch ==========
             policy.train()
 
             # end of epoch
             # log of last step is combined with validation and rollout
             # wandb_run.log(step_log, step=self.global_step)
+            step_log_data = self._to_serializable(step_log)
+            log_record = dict(step_log_data)
+            log_record['event'] = 'epoch_end'
+            log_record['status'] = 'running'
+            log_record['timestamp'] = time.time()
+            self._append_json_log(log_path, log_record)
+            self._write_status(status_path, log_record)
+            logger_items = [
+                f"epoch={log_record['epoch_completed']}/{log_record['target_num_epochs']}",
+                f"global_step={log_record['global_step']}",
+                f"train_loss={log_record['train_loss']:.6f}"
+            ]
+            if 'val_loss' in log_record:
+                logger_items.append(f"val_loss={log_record['val_loss']:.6f}")
+            if 'test_mean_score' in log_record:
+                logger_items.append(f"test_mean_score={log_record['test_mean_score']:.6f}")
+            if 'topk_test_mean_score_mean' in log_record:
+                logger_items.append(
+                    f"topk_test_mean_score_mean={log_record['topk_test_mean_score_mean']:.6f}"
+                )
+                logger_items.append(
+                    f"topk_test_mean_score_count={log_record['topk_test_mean_score_count']}"
+                )
+            logger.info(' '.join(logger_items))
+            wandb_run.log(step_log_data, step=self.global_step)
+            wandb_run.summary['latest_epoch'] = int(log_record['epoch_completed'])
+            if 'test_mean_score' in log_record:
+                wandb_run.summary['latest_test_mean_score'] = log_record['test_mean_score']
+            if 'topk_test_mean_score_mean' in log_record:
+                wandb_run.summary['topk_test_mean_score_mean'] = log_record['topk_test_mean_score_mean']
             self.global_step += 1
             self.epoch += 1
             del step_log
+
+        completion_record = {
+            'event': 'completed',
+            'status': 'completed',
+            'epoch': int(self.epoch),
+            'epoch_completed': int(self.epoch),
+            'target_num_epochs': int(cfg.training.num_epochs),
+            'global_step': int(self.global_step),
+            'timestamp': time.time()
+        }
+        self._append_json_log(log_path, completion_record)
+        self._write_status(status_path, completion_record)
+        logger.info(
+            f"status={completion_record['status']} event={completion_record['event']} "
+            f"epoch={completion_record['epoch_completed']}/{completion_record['target_num_epochs']} "
+            f"global_step={completion_record['global_step']}"
+        )
+        wandb_run.summary['latest_epoch'] = int(self.epoch)
+        wandb_run.summary['is_completed'] = True
+        wandb_run.finish()
 
     def eval(self):
         # load the latest checkpoint

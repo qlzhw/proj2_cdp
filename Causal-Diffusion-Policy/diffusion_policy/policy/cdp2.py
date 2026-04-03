@@ -49,7 +49,7 @@ class DP(BasePolicy):
             buffer_init="zero",
             # parameters passed to step
             with_causal=False,
-            causal_condition_noise_weight=15.0,
+            causal_condition_noise_weight=6.0,
             training_mode_thres=0.2,
             **kwargs):
         super().__init__()
